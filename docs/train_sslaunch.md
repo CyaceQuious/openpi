@@ -1,0 +1,285 @@
+# Pi0.5 训练指南（本环境）
+
+本文档适用于在当前集群环境下，使用 openpi 框架对 pi0.5 进行 fine-tuning，涵盖数据格式要求、训练前准备、单卡调试和 sslaunch 多卡提交。
+
+## 1. 训练数据格式要求
+
+openpi 训练使用 **LeRobot v2.1** 格式的本地数据集。数据集路径默认为 `~/.cache/huggingface/lerobot/<org>/<dataset_name>/`。
+
+### 目录结构
+
+```
+~/.cache/huggingface/lerobot/<org>/<dataset_name>/
+├── meta/
+│   ├── info.json          # 数据集元信息（特征定义、episode 数量、fps 等）
+│   ├── episodes.jsonl     # 每个 episode 的元数据（index, task, length）
+│   ├── tasks.jsonl        # 任务列表（task_index → 自然语言描述）
+│   └── stats.json         # 特征统计（可选，openpi 用自己的 norm_stats）
+├── data/
+│   └── chunk-000/
+│       ├── episode_000000.parquet
+│       ├── episode_000001.parquet
+│       └── ...            # 每个 episode 一个 parquet 文件
+└── videos/
+    └── chunk-000/
+        ├── observation.images.cam_high/
+        │   ├── episode_000000.mp4
+        │   └── ...
+        ├── observation.images.cam_left_wrist/
+        └── observation.images.cam_right_wrist/
+```
+
+### info.json 关键字段
+
+```json
+{
+  "codebase_version": "v2.1",
+  "robot_type": "aloha",
+  "total_episodes": 1000,
+  "total_frames": 679710,
+  "fps": 30,
+  "splits": { "train": "0:1000" },
+  "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+  "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+  "features": {
+    "observation.state": { "dtype": "float32", "shape": [14] },
+    "action": { "dtype": "float32", "shape": [14] },
+    "observation.images.cam_high": { "dtype": "video", "shape": [3, 480, 640] },
+    "observation.images.cam_left_wrist": { "dtype": "video", "shape": [3, 480, 640] },
+    "observation.images.cam_right_wrist": { "dtype": "video", "shape": [3, 480, 640] }
+  }
+}
+```
+
+> 480 * 640 这个分辨率是不是有点高呢?
+
+### 特征命名约定
+
+openpi 的 ALOHA 数据管线（`LeRobotAlohaDataConfig`）期望以下 key：
+
+| 特征 | 说明 |
+|------|------|
+| `observation.state` | 本体感知状态（float32），双臂: `[left_j1..j6, left_gripper, right_j1..j6, right_gripper]`，共 14 维 |
+| `action` | 动作（float32），与 state 同维同语义 |
+| `observation.images.cam_high` | 头部/高位相机 |
+| `observation.images.cam_left_wrist` | 左腕相机 |
+| `observation.images.cam_right_wrist` | 右腕相机 |
+
+这些 key 通过 TrainConfig 中的 `repack_transforms` 映射到模型内部表示。如果你的数据集 key 不同，需在 config 中调整 `RepackTransform`。
+
+### 关于 gripper 值域
+
+pi0.5 base model 预训练时 gripper 使用 `[0.0, 1.0]` 范围（0=全开, 1=全闭）。如果你的数据集 gripper 已在此范围内，可设 `adapt_to_pi=False` 跳过 ALOHA→PI 的 gripper 线性变换。
+
+## 2. 定义训练 Config
+
+在 `src/openpi/training/config.py` 中添加 `TrainConfig`，注册到 `_CONFIGS` 列表。示例（X-One）：
+
+```python
+TrainConfig(
+    name="pi05_xone",                          # 唯一名称，CLI 通过此名引用
+    model=pi0_config.Pi0Config(pi05=True),     # pi0.5 模型
+    data=LeRobotAlohaDataConfig(
+        repo_id="xone/xone26",                 # 对应 ~/.cache/huggingface/lerobot/xone/xone26/
+        adapt_to_pi=False,                      # 是否应用 ALOHA→PI gripper 变换
+        assets=AssetsConfig(
+            assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+            asset_id="trossen",                 # 复用 base 预训练的归一化统计
+        ),
+        base_config=DataConfig(prompt_from_task=True),  # 从 tasks.jsonl 读 prompt
+        repack_transforms=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]
+        ),
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader(
+        "gs://openpi-assets/checkpoints/pi05_base/params"  # 加载 base 预训练权重
+    ),
+    num_train_steps=20_000,
+    batch_size=64,           # 8 卡时全局 batch size
+)
+```
+
+### 常用 TrainConfig 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `num_train_steps` | 30000 | 训练总步数 |
+| `batch_size` | 32 | 全局 batch size（跨所有 GPU） |
+| `save_interval` | 1000 | 每 N 步保存 checkpoint |
+| `keep_period` | 5000 | `step % keep_period == 0` 的 checkpoint 不会被清理 |
+| `overwrite` | False | 是否覆盖已有 checkpoint 目录 |
+| `resume` | False | 是否从上次 checkpoint 恢复训练 |
+| `wandb_enabled` | True | 是否启用 W&B 日志 |
+| `fsdp_devices` | 1 | FSDP 分片设备数（>1 时启用 FSDP，降低单卡显存但可能稍慢） |
+| `checkpoint_base_dir` | `./checkpoints` | checkpoint 基目录 |
+| `exp_name` | (必填) | 实验名，CLI 传入，checkpoint 存入 `<base_dir>/<config_name>/<exp_name>/` |
+
+## 3. 训练前准备
+
+### 3.1 一键准备脚本
+
+如果数据集和资源尚未就绪，运行准备脚本：
+
+```bash
+cd /mnt/vepfs/base2/rongyinze/codebases/openpi
+bash scripts/prepare_xone.sh
+```
+
+此脚本会自动完成：
+1. 安装 Python 依赖（`uv sync`，需代理）
+2. 下载 pi05_base checkpoint (~12GB) 和 norm stats（需代理访问 GCS）
+3. 下载 PaliGemma tokenizer（需代理访问 GCS）
+4. 从 BOS 同步 LeRobot 数据集（内网，无需代理）
+5. 验证所有资源就绪
+
+### 3.2 手动准备
+
+如果不使用一键脚本，需确保以下资源存在：
+
+| 资源 | 路径 | 来源 |
+|------|------|------|
+| Python 依赖 | openpi/.venv/ | `uv sync` |
+| pi05_base checkpoint | `~/.cache/openpi/openpi-assets/checkpoints/pi05_base/params/` | GCS 自动下载 |
+| Norm stats | `~/.cache/openpi/openpi-assets/checkpoints/pi05_base/assets/trossen/` | GCS 自动下载 |
+| PaliGemma tokenizer | `~/.cache/openpi/big_vision/paligemma_tokenizer.model` | GCS 自动下载 |
+| LeRobot 数据集 | `~/.cache/huggingface/lerobot/<org>/<name>/` | 自行转换或同步 |
+
+GCS 资源首次使用时 openpi 会自动下载，但需要代理：
+
+```bash
+export https_proxy=192.168.48.27:18000
+```
+
+如果自动下载太慢，可使用 gsutil（需先 `uv pip install gsutil`）手动下载：
+
+```bash
+gsutil -m cp -r gs://openpi-assets/checkpoints/pi05_base/params ~/.cache/openpi/openpi-assets/checkpoints/pi05_base/params
+```
+
+### 3.3 计算归一化统计
+
+如果不复用 base model 的 norm stats（即 config 中未设置 `AssetsConfig`），需先计算：
+
+```bash
+uv run scripts/compute_norm_stats.py --config-name <your_config_name>
+```
+
+如果复用 base 的 norm stats（推荐，当机器人与 ALOHA 动作空间兼容时），此步可跳过。
+
+## 4. 单卡本地调试
+
+在本机（有 GPU）快速验证 config 是否正确、数据管线是否通畅：
+
+```bash
+cd /mnt/vepfs/base2/rongyinze/codebases/openpi
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+uv run scripts/train.py pi05_xone \
+  --exp-name=debug \
+  --overwrite \
+  --num-train-steps 5 \
+  --batch-size 2 \
+  --no-wandb-enabled
+```
+
+关键参数说明：
+- `pi05_xone`：config 名称（positional arg）
+- `--exp-name=debug`：实验名，checkpoint 存到 `checkpoints/pi05_xone/debug/`
+- `--num-train-steps 5`：只跑 5 步验证
+- `--batch-size 2`：小 batch 防止 OOM
+- `--no-wandb-enabled`：关闭 W&B（tyro CLI 的布尔参数否定形式）
+- `--overwrite`：覆盖已有同名 checkpoint 目录
+- `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9`：允许 JAX 使用 90% GPU 显存
+
+预期输出：
+- Step 0 loss 约 0.1185（pi0.5 初始 loss）
+- 5 步内 loss 略有下降
+- 无报错即说明数据、模型、管线均正常
+
+## 5. sslaunch 多卡集群训练
+
+### 5.1 提交训练任务
+
+项目提供了 `scripts/train_xone_cluster.sh`，封装了资源校验、环境变量设置和训练启动：
+
+```bash
+cd /mnt/vepfs/base2/rongyinze/codebases/openpi
+
+# 用法: bash scripts/train_xone_cluster.sh <config_name> <exp_name>
+# exp_name 会自动追加时间戳，如 xone26_sft → xone26_sft_20260430_082511
+
+sslaunch submit \
+  -c b200 \
+  -q a6000 \
+  -j rongyinze-pi05-xone-sft \
+  -- \
+  scripts/train_xone_cluster.sh pi05_xone xone26_sft
+```
+
+`train_xone_cluster.sh` 会自动完成：
+1. 检查所有预下载资源（checkpoint、norm stats、tokenizer、数据集），缺失则 fail fast
+2. 设置 `HF_HUB_OFFLINE=1` 阻止训练中意外的网络访问
+3. 设置 NCCL 环境变量（`NCCL_P2P_DISABLE=1` 等）
+4. 使用 `--fsdp-devices 8` 启用 FSDP 跨 8 卡分片
+5. 训练日志同时输出到 `logs/<config_name>/<exp_name>.log`
+
+如需训练 `adapt_to_pi=True` 的对比实验：
+
+```bash
+sslaunch submit \
+  -c b200 \
+  -q a6000 \
+  -j rongyinze-pi05-xone-sft \
+  -- \
+  scripts/train_xone_cluster.sh pi05_xone_adapt xone26_sft_adapt
+```
+
+### 5.2 多卡注意事项
+
+- openpi 训练脚本自动检测所有可用 GPU，使用 JAX 的 data parallelism
+- `batch_size` 是**全局** batch size，会自动分配到各卡（例如 batch_size=64，8 卡时每卡 8）
+- 如果单卡显存不够，设 `--fsdp-devices N`（N>1）启用 FSDP 模型分片
+
+## 6. 训练产出
+
+### 6.1 Checkpoint 目录结构
+
+checkpoint 存储路径为 `<checkpoint_base_dir>/<config_name>/<exp_name>/<step>/`：
+
+```
+checkpoints/
+└── pi05_xone/                          # config name
+    └── xone26_sft_20260430_082511/     # exp name
+        └── 19999/                      # step number (0-indexed)
+            ├── params/                 # 模型权重 (~12GB)
+            ├── train_state/            # 优化器状态（恢复训练用）
+            ├── assets/                 # 归一化统计等资源
+            │   └── trossen/
+            │       └── norm_stats.json
+            └── _CHECKPOINT_METADATA    # orbax checkpoint 元数据
+```
+
+### 6.2 Checkpoint 保留策略
+
+- 每 `save_interval`（默认 1000）步保存一次
+- 旧 checkpoint 会被自动删除，**除非** `step % keep_period == 0`（默认 5000）
+- 最终步（`num_train_steps - 1`）始终保留
+- 使用 `--overwrite` 可清除已有同名实验的所有 checkpoint
+
+### 6.3 W&B 监控
+
+训练默认上报到 W&B 项目 `openpi`（可通过 `--project-name` 修改）。W&B run ID 保存在 checkpoint 目录下的 `wandb_id.txt`，`--resume` 时自动恢复同一 run。
+不过 `train_xone_cluster.sh` 默认了 `--no-wandb-enabled`。
+
+> 关于本仓库如何用于 pi 的推理，直接看 README 即可。
