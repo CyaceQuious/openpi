@@ -219,10 +219,13 @@ cd /mnt/vepfs/base2/rongyinze/codebases/openpi
 # 用法: bash scripts/train_xone_cluster.sh <config_name> <exp_name>
 # exp_name 会自动追加时间戳，如 xone26_sft → xone26_sft_20260430_082511
 
-sslaunch submit \
+http_proxy= https_proxy= no_proxy= sslaunch submit \
   -c b200 \
-  -q a6000 \
+  -q embody1 \
   -j rongyinze-pi05-xone-sft \
+  -e BOS_UPLOAD_DIR=bos://base2-test/rongyinze/codebases/openpi/checkpoints \
+  -e UPLOAD_KEEP_PERIOD=5000 \
+  --no-log \
   -- \
   scripts/train_xone_cluster.sh pi05_xone xone26_sft
 ```
@@ -233,6 +236,9 @@ sslaunch submit \
 3. 设置 NCCL 环境变量（`NCCL_P2P_DISABLE=1` 等）
 4. 使用 `--fsdp-devices 8` 启用 FSDP 跨 8 卡分片
 5. 训练日志同时输出到 `logs/<config_name>/<exp_name>.log`
+6. 透传 `BOS_UPLOAD_DIR` / `UPLOAD_KEEP_PERIOD` 给 `train.py`，启用 checkpoint 自动上传 BOS（见 [6.4](#64-自动上传-bos--本地只保留-1-个-checkpoint)）；若设了 `BOS_UPLOAD_DIR` 但 megfile CLI 不存在则 fail fast
+
+> `-e KEY=VALUE` 可多次使用，把环境变量注入 pod；上面两个变量是开启 BOS 自动上传的开关。`--no-log` 让 submit 创建任务后立即返回（训练在 k8s 独立运行），省得 submit 客户端一直挂着流式日志。
 
 如需训练 `adapt_to_pi=True` 的对比实验：
 
@@ -277,9 +283,60 @@ checkpoints/
 - 最终步（`num_train_steps - 1`）始终保留
 - 使用 `--overwrite` 可清除已有同名实验的所有 checkpoint
 
+> 底层是 orbax `CheckpointManager`，初始化时固定 `max_to_keep=1`，并把 config 的 `keep_period` 透传进去（见 `src/openpi/training/checkpoints.py`）。
+> 因此：`keep_period=5000` 时本地会累积 step 0/5000/10000/… 多个 checkpoint；若设 `keep_period=None`，则本地任何时候只保留**最新 1 个** checkpoint（旧的在下一次 save 时被删）。后者配合 6.4 的 BOS 自动上传，可做到"本地只占 1 份磁盘、需要长期保留的 checkpoint 都在 BOS"。
+
 ### 6.3 W&B 监控
 
 训练默认上报到 W&B 项目 `openpi`（可通过 `--project-name` 修改）。W&B run ID 保存在 checkpoint 目录下的 `wandb_id.txt`，`--resume` 时自动恢复同一 run。
 不过 `train_xone_cluster.sh` 默认了 `--no-wandb-enabled`。
+
+### 6.4 自动上传 BOS & 本地只保留 1 个 checkpoint
+
+集群本地磁盘有限，而一个 pi0.5 checkpoint（params + train_state + assets）约 **42GB**。为此 `train.py` 支持在训练过程中把指定 checkpoint 自动上传到 BOS，并配合 `keep_period=None` 让本地始终只占 1 份。
+
+#### 开关：两个环境变量
+
+| 环境变量 | 含义 | 默认 |
+|---|---|---|
+| `BOS_UPLOAD_DIR` | BOS 基础路径前缀；**留空则完全不上传** | `""`（关闭） |
+| `UPLOAD_KEEP_PERIOD` | 上传周期：`step % UPLOAD_KEEP_PERIOD == 0` 的 step 会上传 | `5000` |
+
+实际上传目标为 `<BOS_UPLOAD_DIR>/<config_name>/<exp_name>/<step>/`，例如：
+
+```
+bos://base2-test/rongyinze/codebases/openpi/checkpoints/pi05_xone/pick_place_sft_20260607_173228/5000/
+```
+
+#### 上传哪些 step
+
+`step % UPLOAD_KEEP_PERIOD == 0` 的 step **以及最终 step**（`num_train_steps - 1`）。
+以 `num_train_steps=20000`、`UPLOAD_KEEP_PERIOD=5000` 为例，BOS 上最终会有 4 个 checkpoint：`5000/ 10000/ 15000/ 19999/`。
+
+#### 配合 `keep_period=None` 实现本地只留 1 份
+
+在 TrainConfig 里设 `keep_period=None`（本环境的 `pi05_xone` 已这样配置），orbax `max_to_keep=1` 就会让本地任何时刻只保留最新 1 个 checkpoint。上传时序（save_interval=1000）：
+
+| step | 本地 save | 是否上传 BOS | 本地保留 | BOS 累计 |
+|---|---|---|---|---|
+| 5000 | ✓ | ✓（先 `wait_until_finished` 再 sync） | {5000} | {5000} |
+| 6000 | ✓ | — | {6000}（orbax 删 5000） | {5000} |
+| 10000 | ✓ | ✓ | {10000} | {5000,10000} |
+| 15000 | ✓ | ✓ | {15000} | {5000,10000,15000} |
+| 19999 | ✓ | ✓ | {19999} | {5000,10000,15000,19999} |
+
+关键点：上传发生在 `save_state` 之后、下一次 save（删除旧 ckpt）之前，且上传前会 `checkpoint_manager.wait_until_finished()` 确保 async 落盘完成，所以上传到 BOS 的内容一定完整。
+
+#### 失败处理
+
+`_upload_checkpoint_to_bos`（`scripts/train.py`）用 `subprocess` 调用 megfile CLI（`/mnt/vepfs/base2/rongyinze/miniconda3/bin/megfile sync -f`），**上传失败只 log error、不中断训练**——checkpoint 仍在本地（直到下一次 save 才被删），可事后手动 `megfile sync` 补传。日志关键字：
+
+```
+Uploading checkpoint step 5000: <local> -> <bos>
+BOS upload complete for step 5000        # 成功
+BOS upload failed for step 5000: ...      # 失败（含 stderr）
+```
+
+> megfile 凭证读自 `~/.aws/credentials` + `~/.config/megfile/megfile.conf`。容器内 `$HOME=/home/rongyinze` 与宿主 `/mnt/vepfs/base2/rongyinze` 是同一挂载，所以凭证天然可用。
 
 > 关于本仓库如何用于 pi 的推理，直接看 README 即可。
