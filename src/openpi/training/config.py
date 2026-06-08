@@ -829,7 +829,7 @@ _CONFIGS = [
         name="pi05_xone",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
-            repo_id="xone/xone26",
+            repo_id="xone/pick_place_dual_hand",
             adapt_to_pi=False,
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
@@ -856,6 +856,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
         batch_size=64,
+        keep_period=None,
     ),
     TrainConfig(
         name="pi05_xone_adapt",

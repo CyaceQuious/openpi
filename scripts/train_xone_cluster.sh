@@ -24,7 +24,7 @@ for f in \
     "$OPENPI_CACHE/openpi-assets/checkpoints/pi05_base/params/_CHECKPOINT_METADATA" \
     "$OPENPI_CACHE/openpi-assets/checkpoints/pi05_base/assets/trossen" \
     "$OPENPI_CACHE/big_vision/paligemma_tokenizer.model" \
-    "$LEROBOT_CACHE/xone/xone26/meta/info.json"; do
+    "$LEROBOT_CACHE/xone/pick_place_dual_hand/meta/info.json"; do
     if [ ! -e "$f" ]; then
         echo "FATAL: Missing pre-downloaded resource: $f"
         echo "Run 'bash scripts/prepare_xone.sh' first (with proxy enabled)."
@@ -46,6 +46,17 @@ export XLA_PYTHON_CLIENT_ALLOCATOR=platform
 export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=INFO
 export PYTHONUNBUFFERED=1
+
+export BOS_UPLOAD_DIR="${BOS_UPLOAD_DIR:-}"
+export UPLOAD_KEEP_PERIOD="${UPLOAD_KEEP_PERIOD:-5000}"
+if [ -n "$BOS_UPLOAD_DIR" ]; then
+    MEGFILE_BIN="/mnt/vepfs/base2/rongyinze/miniconda3/bin/megfile"
+    if [ ! -x "$MEGFILE_BIN" ]; then
+        echo "FATAL: megfile CLI not found at $MEGFILE_BIN (needed for BOS upload)"
+        exit 1
+    fi
+    echo "BOS upload:  $BOS_UPLOAD_DIR (period=$UPLOAD_KEEP_PERIOD)"
+fi
 
 echo "=========================================="
 echo "Config:     $CONFIG_NAME"

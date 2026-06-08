@@ -1,7 +1,9 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
+import subprocess
 from typing import Any
 
 import etils.epath as epath
@@ -191,6 +193,28 @@ def train_step(
     return new_state, info
 
 
+_MEGFILE_BIN = "/mnt/vepfs/base2/rongyinze/miniconda3/bin/megfile"
+
+
+def _upload_checkpoint_to_bos(checkpoint_dir, step, bos_target_dir):
+    if jax.process_index() != 0:
+        return
+    src = str(checkpoint_dir / str(step)) + "/"
+    dst = f"{bos_target_dir}/{step}/"
+    logging.info(f"Uploading checkpoint step {step}: {src} -> {dst}")
+    try:
+        result = subprocess.run(
+            [_MEGFILE_BIN, "sync", "-f", src, dst],
+            capture_output=True, text=True, timeout=3600,
+        )
+        if result.returncode != 0:
+            logging.error(f"BOS upload failed for step {step}: {result.stderr}")
+        else:
+            logging.info(f"BOS upload complete for step {step}")
+    except Exception as e:
+        logging.error(f"BOS upload error for step {step}: {e}")
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -216,6 +240,12 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+
+    bos_upload_dir = os.environ.get("BOS_UPLOAD_DIR", "")
+    upload_keep_period = int(os.environ.get("UPLOAD_KEEP_PERIOD", "5000"))
+    bos_upload_path = f"{bos_upload_dir}/{config.name}/{config.exp_name}" if bos_upload_dir else ""
+    if bos_upload_path:
+        logging.info(f"BOS upload enabled: period={upload_keep_period}, target={bos_upload_path}")
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -272,6 +302,9 @@ def main(config: _config.TrainConfig):
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            if bos_upload_path and (step % upload_keep_period == 0 or step == config.num_train_steps - 1):
+                checkpoint_manager.wait_until_finished()
+                _upload_checkpoint_to_bos(config.checkpoint_dir, step, bos_upload_path)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

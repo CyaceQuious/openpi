@@ -52,17 +52,17 @@ unset https_proxy http_proxy
 
 echo ""
 echo "=== 2/3 Syncing LeRobot dataset from BOS (proxy OFF) ==="
-DATASET_DST="$HOME/.cache/huggingface/lerobot/xone/xone26"
+DATASET_DST="$HOME/.cache/huggingface/lerobot/xone/pick_place_dual_hand"
 if [ -f "$DATASET_DST/meta/info.json" ]; then
     echo "  Dataset already exists at $DATASET_DST, skipping."
 else
-    echo "  Downloading from bos://world-model-data/rongyinze/dataset/x-one/lerobotDataset ..."
+    echo "  Downloading from bos://base2-test/rongyinze/dataset/x-one/pick_place_dual_hand/lerobot2.1/ ..."
     conda run --no-capture-output -n base python -u -c "
 from megfile import smart_sync
 import os
-dst = os.path.expanduser('~/.cache/huggingface/lerobot/xone/xone26')
+dst = os.path.expanduser('~/.cache/huggingface/lerobot/xone/pick_place_dual_hand')
 os.makedirs(dst, exist_ok=True)
-smart_sync('bos://world-model-data/rongyinze/dataset/x-one/lerobotDataset/', dst + '/')
+smart_sync('bos://base2-test/rongyinze/dataset/x-one/pick_place_dual_hand/lerobot2.1/', dst + '/')
 print('  dataset sync OK')
 "
 fi
@@ -83,7 +83,7 @@ check() {
 check "$HOME/.cache/openpi/openpi-assets/checkpoints/pi05_base/params/_CHECKPOINT_METADATA"
 check "$HOME/.cache/openpi/openpi-assets/checkpoints/pi05_base/assets/trossen"
 check "$HOME/.cache/openpi/big_vision/paligemma_tokenizer.model"
-check "$HOME/.cache/huggingface/lerobot/xone/xone26/meta/info.json"
+check "$HOME/.cache/huggingface/lerobot/xone/pick_place_dual_hand/meta/info.json"
 
 if [ "$FAIL" -eq 0 ]; then
     echo ""
