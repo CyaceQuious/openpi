@@ -125,6 +125,8 @@ TrainConfig(
 | `checkpoint_base_dir` | `./checkpoints` | checkpoint 基目录 |
 | `exp_name` | (必填) | 实验名，CLI 传入，checkpoint 存入 `<base_dir>/<config_name>/<exp_name>/` |
 
+大多数时候改一下 repo_id 就行了。
+
 ## 3. 训练前准备
 
 ### 3.1 一键准备脚本
@@ -265,16 +267,19 @@ checkpoint 存储路径为 `<checkpoint_base_dir>/<config_name>/<exp_name>/<step
 
 ```
 checkpoints/
-└── pi05_xone/                          # config name
-    └── xone26_sft_20260430_082511/     # exp name
-        └── 19999/                      # step number (0-indexed)
-            ├── params/                 # 模型权重 (~12GB)
-            ├── train_state/            # 优化器状态（恢复训练用）
-            ├── assets/                 # 归一化统计等资源
+└── pi05_xone/                              # config name
+    └── pick_place_sft_20260607_173228/     # exp name
+        ├── config.json                     # ← 本次训练的完整 TrainConfig（train.py 自动写，见 6.5）
+        └── 19999/                          # step number (0-indexed)
+            ├── params/                     # 模型权重 (~12GB)
+            ├── train_state/                # 优化器状态（恢复训练用）
+            ├── assets/                     # 归一化统计等资源
             │   └── trossen/
             │       └── norm_stats.json
-            └── _CHECKPOINT_METADATA    # orbax checkpoint 元数据
+            └── _CHECKPOINT_METADATA        # orbax checkpoint 元数据
 ```
+
+`config.json` 在 **exp 目录层**（每次训练一份），与各 `<step>/` 平级——它描述整个 run，不随 step 变化。BOS 上的目录结构与本地一致（`config.json` 也会上传到 `<BOS_UPLOAD_DIR>/<config_name>/<exp_name>/config.json`）。
 
 ### 6.2 Checkpoint 保留策略
 
@@ -338,5 +343,18 @@ BOS upload failed for step 5000: ...      # 失败（含 stderr）
 ```
 
 > megfile 凭证读自 `~/.aws/credentials` + `~/.config/megfile/megfile.conf`。容器内 `$HOME=/home/rongyinze` 与宿主 `/mnt/vepfs/base2/rongyinze` 是同一挂载，所以凭证天然可用。
+
+### 6.5 TrainConfig 自动记录（config.json）
+
+orbax 的 checkpoint 只存 `params / train_state / assets`，**不存 TrainConfig**。而 TrainConfig 定义在代码里（`config.py` 的 `_CONFIGS`），会被覆盖/改动——一旦改了，旧 checkpoint 再用同名 config 加载时就对不上当初的训练设置（典型如 `repo_id`、`keep_period`）。为此 `train.py` 在训练启动时自动把当前**完整 TrainConfig** 落盘成 `config.json`，让 checkpoint 自描述。
+
+- **写什么**：`dataclasses.asdict(config)` 序列化为 JSON；transforms / weight_loader / filter 等非 JSON 原生字段用 `default=str` 转成字符串表示。涵盖 `name / data.repo_id / model / batch_size / num_train_steps / keep_period / optimizer / lr_schedule` 等全部字段。
+- **何时写**：`main()` 里 checkpoint 目录初始化后立即写一次（不依赖 wandb，`--no-wandb-enabled` 也会写）。仅 `process_index==0` 执行，写失败只 log、不影响训练。
+- **写到哪**：本地 exp 目录 `<checkpoint_dir>/config.json`；若开了 BOS 上传，同时 `megfile cp` 一份到 `<BOS_UPLOAD_DIR>/<config_name>/<exp_name>/config.json`。
+- **实现**：`scripts/train.py` 的 `_save_train_config(config, directory, bos_target_dir)`。
+
+> **无需改启动命令**：该记录是 `train.py` 自动行为，不引入任何新的 CLI 参数或环境变量，5.1 的提交命令照旧。
+
+用途：拿到一个 checkpoint 时，读它的 `config.json` 即可知道是哪个 config、哪个数据集、什么超参产出的——尤其在覆盖式复用 config name（如本仓库直接改 `pi05_xone` 的 `repo_id` 训不同数据集）时，避免靠记忆/猜测。
 
 > 关于本仓库如何用于 pi 的推理，直接看 README 即可。

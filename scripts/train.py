@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+import json
 import logging
 import os
 import platform
@@ -196,6 +197,39 @@ def train_step(
 _MEGFILE_BIN = "/mnt/vepfs/base2/rongyinze/miniconda3/bin/megfile"
 
 
+def _save_train_config(config: _config.TrainConfig, directory: epath.Path, bos_target_dir: str = ""):
+    """Write the resolved TrainConfig to <dir>/config.json so the checkpoint is self-describing.
+
+    The checkpoint itself (orbax) only stores params/train_state/assets, not the TrainConfig.
+    Recording it here lets you know exactly which config produced a checkpoint (config lives in
+    code and can drift / be overwritten). Non-JSON-native fields (transforms, weight_loader,
+    filters) are stringified via default=str.
+    """
+    if jax.process_index() != 0:
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+    config_path = directory / "config.json"
+    try:
+        config_path.write_text(json.dumps(dataclasses.asdict(config), indent=2, default=str))
+        logging.info(f"Wrote TrainConfig to {config_path}")
+    except Exception as e:
+        logging.error(f"Failed to write config.json: {e}")
+        return
+    if bos_target_dir:
+        dst = f"{bos_target_dir}/config.json"
+        try:
+            result = subprocess.run(
+                [_MEGFILE_BIN, "cp", str(config_path), dst],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                logging.error(f"config.json BOS upload failed: {result.stderr}")
+            else:
+                logging.info(f"Uploaded config.json to {dst}")
+        except Exception as e:
+            logging.error(f"config.json BOS upload error: {e}")
+
+
 def _upload_checkpoint_to_bos(checkpoint_dir, step, bos_target_dir):
     if jax.process_index() != 0:
         return
@@ -246,6 +280,9 @@ def main(config: _config.TrainConfig):
     bos_upload_path = f"{bos_upload_dir}/{config.name}/{config.exp_name}" if bos_upload_dir else ""
     if bos_upload_path:
         logging.info(f"BOS upload enabled: period={upload_keep_period}, target={bos_upload_path}")
+
+    # Record the resolved TrainConfig alongside the checkpoints (orbax does not store it).
+    _save_train_config(config, config.checkpoint_dir, bos_upload_path)
 
     data_loader = _data_loader.create_data_loader(
         config,
