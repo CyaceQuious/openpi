@@ -20,11 +20,13 @@ cd "$OPENPI_DIR"
 # Verify pre-downloaded resources exist (fail fast instead of hanging on download)
 OPENPI_CACHE="$HOME/.cache/openpi"
 LEROBOT_CACHE="$HOME/.cache/huggingface/lerobot"
+# Which LeRobot dataset this run needs (override via -e DATASET_REPO_ID=...)
+DATASET_REPO_ID="${DATASET_REPO_ID:-xone/pick_place_dual_hand}"
 for f in \
     "$OPENPI_CACHE/openpi-assets/checkpoints/pi05_base/params/_CHECKPOINT_METADATA" \
     "$OPENPI_CACHE/openpi-assets/checkpoints/pi05_base/assets/trossen" \
     "$OPENPI_CACHE/big_vision/paligemma_tokenizer.model" \
-    "$LEROBOT_CACHE/xone/pick_place_dual_hand/meta/info.json"; do
+    "$LEROBOT_CACHE/$DATASET_REPO_ID/meta/info.json"; do
     if [ ! -e "$f" ]; then
         echo "FATAL: Missing pre-downloaded resource: $f"
         echo "Run 'bash scripts/prepare_xone.sh' first (with proxy enabled)."
